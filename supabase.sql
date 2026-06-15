@@ -1,9 +1,9 @@
 -- ============================================================
 --  PUBLIC GOODS GAME  · Supabase schema
 --  Paste this whole file into the Supabase SQL editor and run.
---  Then enable Realtime on the three tables that need it:
+--  Then enable Realtime on the tables that need it:
 --    Database → Replication → Source: supabase_realtime → toggle
---    players, rounds, contributions.
+--    sessions, players, rounds, contributions, punishments.
 -- ============================================================
 
 create extension if not exists pgcrypto;
@@ -58,6 +58,23 @@ create table if not exists public.contributions (
 create index if not exists contributions_session_round_idx
   on public.contributions(session, round);
 
+-- Punishment round (the final round). One row per punisher→target
+-- choice. Each target loses `damage` points; the punisher loses
+-- `cost` points per target chosen. Resolved by the experimenter's
+-- browser when the round closes (balances floored at 0).
+create table if not exists public.punishments (
+  session         text not null references public.sessions(code) on delete cascade,
+  round           int  not null,
+  punisher_id     text not null,
+  target_id       text not null,
+  damage          numeric not null default 3,
+  cost            numeric not null default 1,
+  submitted_at_ms bigint not null,
+  primary key (session, round, punisher_id, target_id)
+);
+create index if not exists punishments_session_round_idx
+  on public.punishments(session, round);
+
 -- ============================================================
 --  RLS  ·  classroom posture (no auth)
 --  Anyone with the join code can read and write.  Contributions
@@ -70,6 +87,7 @@ alter table public.sessions      enable row level security;
 alter table public.players       enable row level security;
 alter table public.rounds        enable row level security;
 alter table public.contributions enable row level security;
+alter table public.punishments   enable row level security;
 
 -- sessions
 drop policy if exists "sessions read"   on public.sessions;
@@ -101,10 +119,23 @@ create policy "contributions insert" on public.contributions for insert with che
 create policy "contributions update" on public.contributions for update
   using (true) with check (true);
 
+-- punishments: insert open from clients; update open for the close pass
+drop policy if exists "punishments read"   on public.punishments;
+drop policy if exists "punishments insert" on public.punishments;
+drop policy if exists "punishments update" on public.punishments;
+create policy "punishments read"   on public.punishments for select using (true);
+create policy "punishments insert" on public.punishments for insert with check (true);
+create policy "punishments update" on public.punishments for update
+  using (true) with check (true);
+
 -- ============================================================
---  Realtime publication  ·  add the three tables we listen to.
+--  Realtime publication  ·  add the tables we listen to.
 --  (Equivalent to ticking them in Database → Replication.)
+--  sessions MUST be included, or players never leave the lobby
+--  and rounds never auto-close until the experimenter refreshes.
 -- ============================================================
+alter publication supabase_realtime add table public.sessions;
 alter publication supabase_realtime add table public.players;
 alter publication supabase_realtime add table public.rounds;
 alter publication supabase_realtime add table public.contributions;
+alter publication supabase_realtime add table public.punishments;

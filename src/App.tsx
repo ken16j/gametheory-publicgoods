@@ -30,7 +30,7 @@ type GroupMode = "full" | "groups";
 type AutoBase = "endowment" | "balance";
 
 interface SessionConfig {
-  numRounds: number;
+  numRounds: number;        // number of contribution rounds
   groupMode: GroupMode;
   groupSize: number;
   endowment: number;        // seed tokens for round 1 only (1-20)
@@ -39,13 +39,23 @@ interface SessionConfig {
   autoSubmitFraction: number;
   autoSubmitBase: AutoBase;
   regroupEachRound: boolean;
+  punishmentRound: boolean; // append a final punishment-only round
+  punishDamage: number;     // points removed from each chosen target
+  punishCost: number;       // points the punisher pays per target chosen
 }
 const DEFAULT_CONFIG: SessionConfig = {
   numRounds: 6, groupMode: "groups", groupSize: 12,
   endowment: 20, multiplier: 1, roundSeconds: 90,
   autoSubmitFraction: 0.5, autoSubmitBase: "endowment",
   regroupEachRound: true,
+  punishmentRound: true, punishDamage: 3, punishCost: 1,
 };
+
+/* The punishment round, when enabled, is appended after the
+   contribution rounds, so it is round numRounds + 1. */
+const lastRoundNum = (c: SessionConfig) => c.numRounds + (c.punishmentRound ? 1 : 0);
+const isPunishRound = (c: SessionConfig, r: number) =>
+  c.punishmentRound && r === c.numRounds + 1;
 
 interface SessionRow {
   code: string; status: "lobby" | "running" | "done";
@@ -69,6 +79,11 @@ interface ContribRow {
   auto: boolean; submitted_at_ms: number;
   response_ms: number | null;
   payoff?: number; balance_after?: number;
+}
+interface PunishmentRow {
+  session: string; round: number;
+  punisher_id: string; target_id: string;
+  damage: number; cost: number; submitted_at_ms: number;
 }
 
 /* ------------------------------------------------------------
@@ -114,7 +129,10 @@ function downloadText(filename: string, text: string) {
 async function startRound(code: string, r: number, cfg: SessionConfig, prev: Record<string, string[]> | null) {
   const { data: ps } = await sb.from("players").select("id").eq("session", code);
   const ids = (ps ?? []).map((p) => p.id);
-  const groups = !cfg.regroupEachRound && prev ? prev : makeGroups(ids, cfg.groupMode, cfg.groupSize);
+  /* The punishment round reuses the previous round's groups so each
+     player punishes the same people whose contributions they just saw. */
+  const groups = (isPunishRound(cfg, r) || !cfg.regroupEachRound) && prev
+    ? prev : makeGroups(ids, cfg.groupMode, cfg.groupSize);
 
   /* Round 1 seeds every player with the starting endowment. From
      round 2 on, balances carry forward untouched. */
@@ -201,30 +219,116 @@ async function closeRound(code: string, r: number, cfg: SessionConfig) {
   await sb.from("rounds").update({ status: "closed", group_totals: totals })
     .eq("session", code).eq("round", r);
 
-  if (r >= cfg.numRounds)
+  if (r >= cfg.numRounds && !cfg.punishmentRound)
     await sb.from("sessions").update({ status: "done" }).eq("code", code);
+}
+
+/* Resolve the punishment round. Each target loses punishDamage per
+   punisher who chose them; each punisher loses punishCost per target.
+   Balances floor at 0. Non-submitters auto-abstain (punish no one) but
+   can still be punished by others. A per-player marker row is written
+   into contributions (amount = points spent, payoff = points lost) so
+   the admin feed, submitted count and CSV export all keep working. */
+async function closePunishmentRound(code: string, r: number, cfg: SessionConfig) {
+  const [{ data: rd }, { data: ps }, { data: pun }, { data: cs }] = await Promise.all([
+    sb.from("rounds").select("*").eq("session", code).eq("round", r).single(),
+    sb.from("players").select("*").eq("session", code),
+    sb.from("punishments").select("*").eq("session", code).eq("round", r),
+    sb.from("contributions").select("*").eq("session", code).eq("round", r),
+  ]);
+  if (!rd || rd.status === "closed") return;
+  const round = rd as RoundRow;
+  const players: Record<string, PlayerRow> = {};
+  (ps ?? []).forEach((p) => (players[p.id] = p as PlayerRow));
+  const markers: Record<string, ContribRow> = {};
+  (cs ?? []).forEach((c) => (markers[c.player_id] = c as ContribRow));
+
+  const spent: Record<string, number> = {};   // punishCost x targets chosen
+  const damage: Record<string, number> = {};   // punishDamage x punishers
+  (pun ?? []).forEach((p: any) => {
+    spent[p.punisher_id] = (spent[p.punisher_id] ?? 0) + Number(p.cost);
+    damage[p.target_id] = (damage[p.target_id] ?? 0) + Number(p.damage);
+  });
+
+  const balUpdates: { id: string; balance: number }[] = [];
+  const rows: ContribRow[] = [];
+  const groupDamage: Record<string, number> = {};
+  for (const [gid, members] of Object.entries(round.groups)) {
+    let gd = 0;
+    for (const pid of members) {
+      const before = players[pid]?.balance ?? 0;
+      const cost = spent[pid] ?? 0;
+      const dmg = damage[pid] ?? 0;
+      gd += dmg;
+      const after = Math.max(0, before - cost - dmg);
+      balUpdates.push({ id: pid, balance: after });
+      const m = markers[pid];
+      rows.push({
+        session: code, round: r, player_id: pid,
+        name: players[pid]?.name ?? "?", group_id: gid,
+        amount: cost, auto: m ? m.auto : true,
+        submitted_at_ms: m?.submitted_at_ms ?? Date.now(),
+        response_ms: m?.response_ms ?? null,
+        payoff: -dmg, balance_after: after,
+      });
+    }
+    groupDamage[gid] = gd;
+  }
+
+  for (let i = 0; i < rows.length; i += 200)
+    await sb.from("contributions").upsert(rows.slice(i, i + 200));
+  await Promise.all(
+    balUpdates.map((u) =>
+      sb.from("players").update({ balance: u.balance }).eq("id", u.id).eq("session", code)
+    )
+  );
+  await sb.from("rounds").update({ status: "closed", group_totals: groupDamage })
+    .eq("session", code).eq("round", r);
+  await sb.from("sessions").update({ status: "done" }).eq("code", code);
 }
 
 /* ------------------------------------------------------------
    5. CSV EXPORT
    ------------------------------------------------------------ */
 async function exportCsv(code: string) {
-  const [{ data: ps }, { data: cs }] = await Promise.all([
+  const [{ data: ps }, { data: cs }, { data: pun }, { data: ss }] = await Promise.all([
     sb.from("players").select("*").eq("session", code),
     sb.from("contributions").select("*").eq("session", code).order("round").order("player_id"),
+    sb.from("punishments").select("*").eq("session", code),
+    sb.from("sessions").select("config").eq("code", code).maybeSingle(),
   ]);
+  const cfg = (ss?.config ?? DEFAULT_CONFIG) as SessionConfig;
   const players: Record<string, PlayerRow> = {};
   (ps ?? []).forEach((p) => (players[p.id] = p as PlayerRow));
+
+  /* Aggregate punishment activity per (round, player), both as the
+     punisher (targets chosen, points spent) and as a target (times
+     punished, points lost). */
+  const targets: Record<string, number> = {}, spent: Record<string, number> = {};
+  const hits: Record<string, number> = {}, lost: Record<string, number> = {};
+  (pun ?? []).forEach((p: any) => {
+    const pk = `${p.round}:${p.punisher_id}`, tk = `${p.round}:${p.target_id}`;
+    targets[pk] = (targets[pk] ?? 0) + 1; spent[pk] = (spent[pk] ?? 0) + Number(p.cost);
+    hits[tk] = (hits[tk] ?? 0) + 1; lost[tk] = (lost[tk] ?? 0) + Number(p.damage);
+  });
+
   const esc = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
-  const head = ["session","round","player_id","player_number","name","gender","field_of_study","group_id",
-    "contribution","auto_submitted","submitted_at_iso","response_ms","dividend","balance_after"].join(",");
-  const body = (cs ?? []).map((c: any) => [
-    code, c.round, c.player_id, players[c.player_id]?.seat ?? "",
-    players[c.player_id]?.name ?? c.name,
-    players[c.player_id]?.gender ?? "", players[c.player_id]?.field ?? "",
-    c.group_id, c.amount, c.auto, new Date(Number(c.submitted_at_ms)).toISOString(),
-    c.response_ms ?? "", c.payoff ?? "", c.balance_after ?? "",
-  ].map(esc).join(",")).join("\n");
+  const head = ["session","round","round_type","player_id","player_number","name","gender","field_of_study","group_id",
+    "contribution","auto_submitted","submitted_at_iso","response_ms","dividend","balance_after",
+    "targets_punished","points_spent_punishing","times_punished","points_lost_to_punishment"].join(",");
+  const body = (cs ?? []).map((c: any) => {
+    const k = `${c.round}:${c.player_id}`;
+    const isPun = isPunishRound(cfg, c.round);
+    return [
+      code, c.round, isPun ? "punishment" : "contribution", c.player_id, players[c.player_id]?.seat ?? "",
+      players[c.player_id]?.name ?? c.name,
+      players[c.player_id]?.gender ?? "", players[c.player_id]?.field ?? "",
+      c.group_id, isPun ? "" : c.amount, c.auto, new Date(Number(c.submitted_at_ms)).toISOString(),
+      c.response_ms ?? "", isPun ? "" : (c.payoff ?? ""), c.balance_after ?? "",
+      isPun ? (targets[k] ?? 0) : "", isPun ? (spent[k] ?? 0) : "",
+      isPun ? (hits[k] ?? 0) : "", isPun ? (lost[k] ?? 0) : "",
+    ].map(esc).join(",");
+  }).join("\n");
   downloadText(`pgg_${code}.csv`, head + "\n" + body);
 }
 
@@ -346,6 +450,39 @@ function useGroupBreakdown(
   return rows;
 }
 
+/* Targets for the punishment round: the player's own group (minus
+   themselves) shown with each member's contribution from prevRound,
+   the last contribution round the player just observed. */
+function usePunishTargets(
+  code: string | null, pid: string | null, round: RoundRow | null, prevRound: number
+) {
+  const [rows, setRows] = useState<{ id: string; seat: number; amount: number }[]>([]);
+  useEffect(() => {
+    setRows([]);
+    if (!code || !pid || !round) return;
+    let active = true;
+    const gid = groupOf(round.groups, pid);
+    const memberIds = (round.groups[gid] ?? []).filter((x) => x !== pid);
+    if (memberIds.length === 0) return;
+    Promise.all([
+      sb.from("players").select("id,seat").in("id", memberIds),
+      sb.from("contributions").select("player_id,amount")
+        .eq("session", code).eq("round", prevRound).in("player_id", memberIds),
+    ]).then(([{ data: ps }, { data: cs }]) => {
+      if (!active) return;
+      const seatOf: Record<string, number> = {};
+      (ps ?? []).forEach((p: any) => (seatOf[p.id] = p.seat));
+      const amtOf: Record<string, number> = {};
+      (cs ?? []).forEach((c: any) => (amtOf[c.player_id] = Number(c.amount)));
+      setRows(memberIds
+        .map((mid) => ({ seat: seatOf[mid] ?? 0, amount: amtOf[mid] ?? 0, id: mid }))
+        .sort((a, b) => a.seat - b.seat));
+    });
+    return () => { active = false; };
+  }, [code, pid, round?.round, prevRound]);
+  return rows;
+}
+
 function useAdminFeed(code: string | null) {
   const [players, setPlayers] = useState<PlayerRow[]>([]);
   const [contribs, setContribs] = useState<ContribRow[]>([]);
@@ -433,6 +570,59 @@ function TokenSplitter({ endowment, value, onChange, disabled }:
   );
 }
 
+/* Dependency-free SVG charts. Colours come from the CSS variables. */
+function LineChart({ points, height = 190 }: { points: { x: number; y: number }[]; height?: number }) {
+  const w = 560, pad = 30;
+  if (points.length === 0) return null;
+  const maxY = Math.max(1, ...points.map((p) => p.y));
+  const n = points.length;
+  const X = (i: number) => pad + (n <= 1 ? (w - 2 * pad) / 2 : (i / (n - 1)) * (w - 2 * pad));
+  const Y = (y: number) => height - pad - (y / maxY) * (height - 2 * pad);
+  const d = points.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p.y).toFixed(1)}`).join(" ");
+  return (
+    <svg className="chart" viewBox={`0 0 ${w} ${height}`} width="100%" role="img" aria-label="Average contribution per round">
+      <line x1={pad} y1={height - pad} x2={w - pad} y2={height - pad} className="axis" />
+      <line x1={pad} y1={pad} x2={pad} y2={height - pad} className="axis" />
+      {n > 1 && <path d={d} className="line" />}
+      {points.map((p, i) => (
+        <g key={i}>
+          <circle cx={X(i)} cy={Y(p.y)} r={4} className="dot" />
+          <text x={X(i)} y={height - pad + 16} textAnchor="middle" className="chart-lbl">R{p.x}</text>
+          <text x={X(i)} y={Y(p.y) - 9} textAnchor="middle" className="chart-val">{p.y}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+function BarChart({ bars, height = 210, suffix = "" }:
+  { bars: { label: string; value: number; tone?: string }[]; height?: number; suffix?: string }) {
+  const w = Math.max(340, bars.length * 30), pad = 26;
+  if (bars.length === 0) return null;
+  const max = Math.max(1, ...bars.map((b) => b.value));
+  const bw = (w - 2 * pad) / bars.length;
+  const showLabels = bars.length <= 28;
+  return (
+    <svg className="chart" viewBox={`0 0 ${w} ${height}`} width="100%" role="img" aria-label="Contributions this round">
+      <line x1={pad} y1={height - pad} x2={w - pad} y2={height - pad} className="axis" />
+      {bars.map((b, i) => {
+        const h = (b.value / max) * (height - 2 * pad);
+        const x = pad + i * bw;
+        return (
+          <g key={i}>
+            <rect x={x + bw * 0.15} y={height - pad - h} width={bw * 0.7} height={Math.max(0, h)} rx={2}
+              fill={b.tone === "me" ? "var(--gold)" : "var(--peri)"} />
+            {showLabels && b.value > 0 &&
+              <text x={x + bw / 2} y={height - pad - h - 5} textAnchor="middle" className="chart-val">{b.value}{suffix}</text>}
+            {showLabels &&
+              <text x={x + bw / 2} y={height - pad + 14} textAnchor="middle" className="chart-lbl">{b.label}</text>}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 /* ------------------------------------------------------------
    8. PLAYER APP
    ------------------------------------------------------------ */
@@ -451,11 +641,17 @@ function PlayerApp() {
   const myContrib = useMyContrib(code, pid, session?.current_round ?? null);
   const breakdown = useGroupBreakdown(code, pid, round);
   const [pick, setPick] = useState(0);
+  const [punSel, setPunSel] = useState<string[]>([]);   // chosen target ids
+  const [bdSort, setBdSort] = useState<"seat" | "desc" | "asc">("seat");
   const seenRound = useRef(0);
+
+  const cfg0 = session?.config;
+  const punishing = !!cfg0 && !!round && isPunishRound(cfg0, round.round);
+  const punTargets = usePunishTargets(code, pid, punishing ? round : null, cfg0?.numRounds ?? 0);
 
   useEffect(() => {
     if (round?.status === "open" && round.round !== seenRound.current) {
-      seenRound.current = round.round; setPick(0);
+      seenRound.current = round.round; setPick(0); setPunSel([]);
     }
   }, [round?.round, round?.status]);
 
@@ -495,6 +691,36 @@ function PlayerApp() {
     if (error && !/duplicate/i.test(error.message)) setErr(error.message);
   }
 
+  async function leave() {
+    if (code && pid) await sb.from("players").delete().eq("id", pid).eq("session", code);
+    localStorage.removeItem("pgg_code"); localStorage.removeItem("pgg_pid");
+    setCode(null); setPid(null);
+    setCodeInput(""); setName(""); setGender(""); setField(""); setErr("");
+  }
+
+  async function submitPunishment() {
+    if (!code || !pid || !round || round.status !== "open" || myContrib) return;
+    if (Date.now() > round.ends_at_ms) return;
+    const cfg = session!.config;
+    const gid = groupOf(round.groups, pid);
+    const nowMs = Date.now();
+    const cost = punSel.length * cfg.punishCost;
+    // Marker row records the submission and the points spent punishing.
+    const { error } = await sb.from("contributions").insert({
+      session: code, round: round.round, player_id: pid,
+      name: me?.name ?? "", group_id: gid,
+      amount: cost, auto: false, submitted_at_ms: nowMs,
+      response_ms: nowMs - round.started_at_ms,
+    });
+    if (error && !/duplicate/i.test(error.message)) { setErr(error.message); return; }
+    if (punSel.length) {
+      await sb.from("punishments").insert(punSel.map((tid) => ({
+        session: code, round: round.round, punisher_id: pid, target_id: tid,
+        damage: cfg.punishDamage, cost: cfg.punishCost, submitted_at_ms: nowMs,
+      })));
+    }
+  }
+
   if (!code || !pid) return (
     <div className="card narrow">
       <Eyebrow>Join session</Eyebrow>
@@ -522,21 +748,92 @@ function PlayerApp() {
       <h1>You're in, {me?.name?.split(" ")[0]}.</h1>
       <p className="muted">Waiting for the experimenter to start. Keep this screen open.</p>
       <div className="pulse" />
+      <button className="ghost" onClick={leave}>Exit lobby</button>
     </div>
   );
 
-  if (session.status === "done") return (
-    <div className="card narrow center">
-      <Eyebrow>Session complete</Eyebrow>
-      <h1><span className="mono fundc">{Math.round(me?.balance ?? 0)}</span> tokens</h1>
-      <p className="muted">Your total earnings over {session.config.numRounds} rounds. Thank you for playing.</p>
-    </div>
-  );
+  if (session.status === "done") {
+    const punMarker = session.config.punishmentRound ? myContrib : null;
+    const spent = Math.round(punMarker?.amount ?? 0);
+    const lost = punMarker ? Math.max(0, Math.round(-(punMarker.payoff ?? 0))) : 0;
+    return (
+      <div className="card narrow center">
+        <Eyebrow>Session complete</Eyebrow>
+        <h1><span className="mono fundc">{Math.round(me?.balance ?? 0)}</span> tokens</h1>
+        <p className="muted">Your total earnings over {session.config.numRounds} contribution round{session.config.numRounds === 1 ? "" : "s"}
+          {session.config.punishmentRound ? " plus the punishment round" : ""}. Thank you for playing.</p>
+        {punMarker && (
+          <div className="stats">
+            <Stat label="spent punishing" value={spent} />
+            <Stat label="lost to punishment" value={lost} tone={lost > 0 ? "gold" : ""} />
+          </div>
+        )}
+      </div>
+    );
+  }
 
   const cfg = session.config;
   if (!round) return <div className="card narrow"><p>Preparing round…</p></div>;
 
   const stack = Math.max(0, Math.round(me?.balance ?? 0)); // tokens I can spend
+
+  /* ---- Punishment round (the appended final round) ---- */
+  if (punishing && round.status === "open" && !myContrib) {
+    const affordable = Math.floor(stack / cfg.punishCost);
+    const cost = punSel.length * cfg.punishCost;
+    const toggle = (id: string) => setPunSel((cur) =>
+      cur.includes(id) ? cur.filter((x) => x !== id)
+        : cur.length >= affordable ? cur : [...cur, id]);
+    return (
+      <div className="card narrow">
+        <div className="head-row">
+          <div><Eyebrow>Final round · punishment</Eyebrow>
+            <h1>Punish free riders?</h1></div>
+          <TimerRing endsAtMs={round.ends_at_ms} totalMs={cfg.roundSeconds * 1000} />
+        </div>
+        <p className="muted">Here is everyone who was in your group last round and what each put in. Tap anyone to dock them {cfg.punishDamage} point{cfg.punishDamage === 1 ? "" : "s"} — it costs you {cfg.punishCost} point{cfg.punishCost === 1 ? "" : "s"} each. You hold {stack}, so you can punish up to {affordable}. No score drops below zero.</p>
+        <div className="punish-list">
+          {punTargets.map((t) => {
+            const on = punSel.includes(t.id);
+            const blocked = !on && punSel.length >= affordable;
+            return (
+              <button key={t.id} type="button" disabled={blocked}
+                className={`punish-row ${on ? "on" : ""}`} onClick={() => toggle(t.id)}>
+                <span className="bd-name mono">Player {t.seat}</span>
+                <span className="punish-meta mono">put in {t.amount}</span>
+                <span className="punish-tag">{on ? `−${cfg.punishDamage}` : "punish"}</span>
+              </button>
+            );
+          })}
+        </div>
+        {punTargets.length === 0 && <p className="muted">No one else is in your group to punish.</p>}
+        <button className="primary" onClick={submitPunishment}>
+          {punSel.length === 0 ? "Punish no one" : `Punish ${punSel.length} · cost ${cost}`}
+        </button>
+        {err && <p className="error">{err}</p>}
+        <div className="foot mono">you hold {stack} · spending {cost}</div>
+      </div>
+    );
+  }
+
+  if (punishing && round.status === "open" && myContrib) return (
+    <div className="card narrow center">
+      <Eyebrow>Final round · punishment</Eyebrow>
+      <h1>Locked in.</h1>
+      <p className="muted">{myContrib.auto
+        ? "The clock beat you, so you punished no one."
+        : `You spent ${Math.round(myContrib.amount)} point${Math.round(myContrib.amount) === 1 ? "" : "s"} punishing.`} Waiting for results.</p>
+      <TimerRing endsAtMs={round.ends_at_ms} totalMs={cfg.roundSeconds * 1000} />
+    </div>
+  );
+
+  if (punishing && round.status === "closed") return (
+    <div className="card narrow center">
+      <Eyebrow>Punishment results</Eyebrow>
+      <h1>Tallying the final scores…</h1>
+      <div className="pulse" />
+    </div>
+  );
 
   if (round.status === "open" && !myContrib) return (
     <div className="card narrow">
@@ -581,10 +878,16 @@ function PlayerApp() {
       <div className="breakdown">
         <div className="bd-head">
           <span>{fullPool ? "Everyone this round" : "Your group this round"}</span>
-          <span className="mono dim">{breakdown.length} player{breakdown.length === 1 ? "" : "s"}</span>
+          <span className="bd-sort">
+            <button className={`sort-btn ${bdSort === "seat" ? "on" : ""}`} onClick={() => setBdSort("seat")}>player</button>
+            <button className={`sort-btn ${bdSort === "desc" ? "on" : ""}`} onClick={() => setBdSort("desc")} aria-label="Sort highest first">high → low</button>
+            <button className={`sort-btn ${bdSort === "asc" ? "on" : ""}`} onClick={() => setBdSort("asc")} aria-label="Sort lowest first">low → high</button>
+          </span>
         </div>
         <div className="bd-list">
-          {breakdown.map((b) => {
+          {(bdSort === "seat" ? breakdown
+            : [...breakdown].sort((a, b) => bdSort === "desc" ? b.amount - a.amount : a.amount - b.amount)
+          ).map((b) => {
             const max = Math.max(1, ...breakdown.map((x) => x.amount));
             return (
               <div key={b.seat} className={`bd-row ${b.isMe ? "me" : ""}`}>
@@ -599,7 +902,11 @@ function PlayerApp() {
       </div>
 
       {myContrib?.auto && <p className="error">The clock beat you this round, so {Math.round(cfg.autoSubmitFraction * 100)}% of your share was contributed automatically.</p>}
-      <p className="muted">{round.round < cfg.numRounds ? "The next round will start shortly. Stay on this screen." : "That was the final round."}</p>
+      <p className="muted">{round.round < cfg.numRounds
+        ? "The next round will start shortly. Stay on this screen."
+        : cfg.punishmentRound
+          ? "Next is the punishment round. Stay on this screen."
+          : "That was the final round."}</p>
     </div>
   );
 }
@@ -615,12 +922,17 @@ function AdminApp() {
   const { players, contribs } = useAdminFeed(code);
   const closing = useRef(false);
   const now = useNow(500);
+  const [live, setLive] = useState(false);   // projector / presentation mode
 
   useEffect(() => {
     if (!code || !session || !round) return;
     if (round.status === "open" && now > round.ends_at_ms + 600 && !closing.current) {
       closing.current = true;
-      closeRound(code, round.round, session.config).finally(() => (closing.current = false));
+      const cfg = session.config;
+      const close = isPunishRound(cfg, round.round)
+        ? closePunishmentRound(code, round.round, cfg)
+        : closeRound(code, round.round, cfg);
+      close.finally(() => (closing.current = false));
     }
   }, [now, code, session, round]);
 
@@ -643,12 +955,12 @@ function AdminApp() {
           onChange={(e) => set("numRounds", Math.max(4, Math.min(10, +e.target.value)))} /></label>
         <label>Grouping
           <select value={cfg.groupMode} onChange={(e) => set("groupMode", e.target.value as GroupMode)}>
-            <option value="groups">Random groups of 10–15</option>
+            <option value="groups">Random groups of 4–15</option>
             <option value="full">One full pool (everyone)</option>
           </select></label>
-        <label>Group size (10–15)<input type="number" min={10} max={15} value={cfg.groupSize}
+        <label>Group size (4–15)<input type="number" min={4} max={15} value={cfg.groupSize}
           disabled={cfg.groupMode === "full"}
-          onChange={(e) => set("groupSize", Math.max(10, Math.min(15, +e.target.value)))} /></label>
+          onChange={(e) => set("groupSize", Math.max(4, Math.min(15, +e.target.value)))} /></label>
         <label>Tokens per player (1–20)<input type="number" min={1} max={20} value={cfg.endowment}
           onChange={(e) => set("endowment", Math.max(1, Math.min(20, +e.target.value)))} /></label>
         <label>Dividend multiplier (0.1–2)<input type="number" step={0.1} min={0.1} max={2} value={cfg.multiplier}
@@ -667,8 +979,19 @@ function AdminApp() {
             <option value="true">Yes (stranger matching)</option>
             <option value="false">No (fixed groups)</option>
           </select></label>
+        <label>Punishment round
+          <select value={String(cfg.punishmentRound)} onChange={(e) => set("punishmentRound", e.target.value === "true")}>
+            <option value="true">Yes (appended final round)</option>
+            <option value="false">No</option>
+          </select></label>
+        <label>Punish: cost to target<input type="number" min={0} value={cfg.punishDamage}
+          disabled={!cfg.punishmentRound}
+          onChange={(e) => set("punishDamage", Math.max(0, +e.target.value))} /></label>
+        <label>Punish: cost to you<input type="number" min={0} value={cfg.punishCost}
+          disabled={!cfg.punishmentRound}
+          onChange={(e) => set("punishCost", Math.max(1, +e.target.value))} /></label>
       </div>
-      <p className="muted">Tokens carry forward. Round 1 seeds every player with the starting tokens; from then on a player can contribute up to whatever they currently hold. Each round a player's group earns its total contribution divided by group size, times the multiplier, rounded to a whole number. A multiplier above 1 makes the group fund grow the pie; below 1 it shrinks it.</p>
+      <p className="muted">Tokens carry forward. Round 1 seeds every player with the starting tokens; from then on a player can contribute up to whatever they currently hold. Each round a player's group earns its total contribution divided by group size, times the multiplier, rounded to a whole number. A multiplier above 1 makes the group fund grow the pie; below 1 it shrinks it.{cfg.punishmentRound ? ` A final punishment round is appended: players see their last group's anonymous contributions and may dock ${cfg.punishDamage} point(s) from anyone, paying ${cfg.punishCost} each. Scores floor at zero.` : ""}</p>
       <button className="primary" onClick={create}>Create session</button>
     </div>
   );
@@ -679,14 +1002,80 @@ function AdminApp() {
   const roundContribs = contribs.filter((c) => c.round === r);
   const submitted = roundContribs.length;
 
+  const totalRounds = lastRoundNum(conf);
+  const punRound = isPunishRound(conf, r);
+  const seatOf: Record<string, number> = {};
+  players.forEach((p) => (seatOf[p.id] = p.seat));
+
+  /* Average contribution per contribution round, for the trend line. */
+  const avgPoints: { x: number; y: number }[] = [];
+  for (let rr = 1; rr <= conf.numRounds; rr++) {
+    const cs = contribs.filter((c) => c.round === rr);
+    if (cs.length) avgPoints.push({ x: rr, y: Math.round(cs.reduce((s, c) => s + Number(c.amount), 0) / cs.length) });
+  }
+  /* Per-player bars for the current round, anonymised and sorted high→low.
+     Revealed only once the round closes, so on-screen data never biases
+     players who are still deciding. On the punishment round the bar shows
+     points each player lost to punishment. */
+  const revealRound = !!round && round.status === "closed";
+  const roundBars = revealRound
+    ? roundContribs.map((c) => ({
+        label: `P${seatOf[c.player_id] ?? "?"}`,
+        value: punRound ? Math.max(0, -(Number(c.payoff) || 0)) : Number(c.amount),
+      })).sort((a, b) => b.value - a.value)
+    : [];
+  const barTitle = punRound ? "Points lost to punishment, by player" : "Contributions this round, by player";
+  const headline = session.status === "lobby" ? "Lobby open" :
+    session.status === "done" ? "Session complete" :
+      punRound ? "Punishment round" : `Round ${r} of ${conf.numRounds}`;
+
+  /* Live / projector mode: large, anonymised, chart-forward. */
+  if (live) return (
+    <div className="present">
+      <div className="present-top">
+        <div>
+          <div className="present-code mono">{code}</div>
+          <div className="present-title">{headline}</div>
+        </div>
+        <div className="present-stats">
+          <div className="present-stat"><b>{players.length}</b><span>players</span></div>
+          {session.status === "running" && round?.status === "open" && (
+            <><div className="present-stat"><b>{submitted}/{players.length}</b><span>submitted</span></div>
+              <TimerRing endsAtMs={round.ends_at_ms} totalMs={conf.roundSeconds * 1000} /></>
+          )}
+          <button className="ghost present-exit" onClick={() => setLive(false)}>Exit live view</button>
+        </div>
+      </div>
+      {session.status === "running" && round?.status === "open" && (
+        <div className="present-wait">
+          <div className="present-big mono">{submitted}<span> / {players.length}</span></div>
+          <p className="muted">Locked in so far. The breakdown appears here the moment the round closes.</p>
+        </div>
+      )}
+      {avgPoints.length > 0 && (
+        <div className="chart-card big">
+          <div className="bd-head"><span>Average contribution per round</span></div>
+          <LineChart points={avgPoints} height={260} />
+        </div>
+      )}
+      {roundBars.length > 0 && (
+        <div className="chart-card big">
+          <div className="bd-head"><span>{barTitle}</span><span className="mono dim">anonymous · {roundBars.length}</span></div>
+          <BarChart bars={roundBars} height={300} />
+        </div>
+      )}
+      {session.status === "done" && avgPoints.length === 0 && roundBars.length === 0 && (
+        <p className="muted">No round data yet.</p>
+      )}
+    </div>
+  );
+
   return (
     <div className="card wide">
       <div className="admin-head">
         <div>
           <Eyebrow>Session {code}</Eyebrow>
-          <h1>{session.status === "lobby" ? "Lobby open" :
-            session.status === "done" ? "Session complete" :
-              `Round ${r} of ${conf.numRounds}`}</h1>
+          <h1>{headline}</h1>
         </div>
         <div className="head-stats">
           <Stat label="players" value={players.length} />
@@ -706,18 +1095,38 @@ function AdminApp() {
         </>
       )}
 
-      {session.status === "running" && round?.status === "closed" && r < conf.numRounds && (
+      {session.status === "running" && round?.status === "closed" && r < totalRounds && (
         <button className="primary" onClick={() => startRound(code, r + 1, conf, round.groups)}>
-          Start round {r + 1}
+          {isPunishRound(conf, r + 1) ? "Start punishment round" : `Start round ${r + 1}`}
         </button>
       )}
 
+      {session.status !== "lobby" && (
+        <button className="ghost" onClick={() => setLive(true)}>Live view (projector)</button>
+      )}
       {(session.status === "done" || contribs.length > 0) && (
         <button className="ghost" onClick={() => exportCsv(code)}>Export CSV (per player, per round)</button>
       )}
-      <button className="ghost" onClick={() => { localStorage.removeItem("pgg_admin"); setCode(null); }}>
+      <button className="ghost" onClick={() => { localStorage.removeItem("pgg_admin"); setLive(false); setCode(null); }}>
         New session
       </button>
+
+      {(avgPoints.length > 0 || roundBars.length > 0) && (
+        <div className="charts">
+          {avgPoints.length > 0 && (
+            <div className="chart-card">
+              <div className="bd-head"><span>Average contribution per round</span></div>
+              <LineChart points={avgPoints} />
+            </div>
+          )}
+          {roundBars.length > 0 && (
+            <div className="chart-card">
+              <div className="bd-head"><span>{barTitle}</span><span className="mono dim">anonymous</span></div>
+              <BarChart bars={roundBars} />
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="table-wrap">
         <table>
@@ -867,5 +1276,47 @@ td.num,th.num{text-align:right}
 .bd-fill{display:block;height:100%;background:var(--peri);border-radius:5px;transition:width .4s}
 .bd-amt{font-size:13px;font-weight:700;text-align:right}
 @media(max-width:420px){.bd-row{grid-template-columns:96px 1fr 28px}}
+/* breakdown sort control */
+.bd-sort{display:flex;gap:4px}
+.sort-btn{width:auto;margin:0;padding:4px 9px;font-size:11px;font-weight:600;border-radius:7px;
+  background:transparent;border:1px solid var(--line);color:var(--ink2)}
+.sort-btn.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+/* charts */
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:20px}
+@media(max-width:760px){.charts{grid-template-columns:1fr}}
+.chart-card{border:1px solid var(--line);border-radius:10px;padding:14px}
+.chart{display:block;margin-top:8px;overflow:visible}
+.chart .axis{stroke:var(--line);stroke-width:1}
+.chart .line{fill:none;stroke:var(--peri-deep);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round}
+.chart .dot{fill:var(--peri-deep)}
+.chart-lbl{fill:var(--ink2);font-size:10px;font-family:'Spline Sans Mono',monospace}
+.chart-val{fill:var(--ink);font-size:10px;font-weight:700;font-family:'Spline Sans Mono',monospace}
+/* punishment picker */
+.punish-list{display:flex;flex-direction:column;gap:8px;margin:8px 0 14px}
+.punish-row{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:10px;width:100%;
+  margin:0;padding:11px 13px;text-align:left;background:#FBFCFB;border:1px solid var(--line);border-radius:10px;font-weight:500}
+.punish-row .bd-name{font-size:14px}
+.punish-meta{font-size:12px;color:var(--ink2)}
+.punish-tag{font-family:'Spline Sans Mono',monospace;font-size:12px;font-weight:700;color:var(--ink2);
+  border:1px solid var(--line);border-radius:6px;padding:2px 8px}
+.punish-row.on{border-color:var(--alarm);background:#FBEFEC}
+.punish-row.on .punish-tag{color:#fff;background:var(--alarm);border-color:var(--alarm)}
+.punish-row:disabled{opacity:.5}
+/* live / projector view */
+.present{width:100%;max-width:1100px;margin-top:24px;display:flex;flex-direction:column;gap:18px}
+.present-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;
+  border-bottom:2px solid var(--ink);padding-bottom:14px;flex-wrap:wrap}
+.present-code{font-size:clamp(28px,6vw,52px);font-weight:700;letter-spacing:.16em;color:var(--peri-deep)}
+.present-title{font-size:clamp(20px,3vw,30px);font-weight:700;margin-top:2px}
+.present-stats{display:flex;align-items:center;gap:22px}
+.present-stat{display:flex;flex-direction:column;align-items:flex-start}
+.present-stat b{font-family:'Spline Sans Mono',monospace;font-size:clamp(22px,3vw,32px)}
+.present-stat span{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2)}
+.present-exit{width:auto;margin:0;padding:9px 14px;font-size:13px}
+.present-wait{text-align:center;padding:30px 0}
+.present-big{font-size:clamp(56px,14vw,140px);font-weight:700;line-height:1;color:var(--peri-deep)}
+.present-big span{color:var(--ink2);font-size:.4em}
+.present .chart-card{padding:20px}
+.present .chart-lbl{font-size:13px}.present .chart-val{font-size:13px}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 `;
