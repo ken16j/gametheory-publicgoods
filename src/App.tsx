@@ -698,6 +698,17 @@ function PlayerApp() {
     setCodeInput(""); setName(""); setGender(""); setField(""); setErr("");
   }
 
+  /* Leave mid-game. Unlike the lobby exit this keeps the player's row, so
+     the running game's group sizes and the dataset stay intact — any rounds
+     they now miss are auto-submitted like a non-responder. They can rejoin. */
+  function quitGame() {
+    if (!window.confirm("Leave the game? You won't be able to act in the remaining rounds — any you miss are auto-submitted. Your earnings so far are kept.")) return;
+    localStorage.removeItem("pgg_code"); localStorage.removeItem("pgg_pid");
+    setCode(null); setPid(null);
+    setCodeInput(""); setName(""); setGender(""); setField(""); setErr("");
+  }
+  const leaveBtn = <button className="ghost leave-game" onClick={quitGame}>Leave game</button>;
+
   async function submitPunishment() {
     if (!code || !pid || !round || round.status !== "open" || myContrib) return;
     if (Date.now() > round.ends_at_ms) return;
@@ -812,6 +823,7 @@ function PlayerApp() {
         </button>
         {err && <p className="error">{err}</p>}
         <div className="foot mono">you hold {stack} · spending {cost}</div>
+        {leaveBtn}
       </div>
     );
   }
@@ -824,6 +836,7 @@ function PlayerApp() {
         ? "The clock beat you, so you punished no one."
         : `You spent ${Math.round(myContrib.amount)} point${Math.round(myContrib.amount) === 1 ? "" : "s"} punishing.`} Waiting for results.</p>
       <TimerRing endsAtMs={round.ends_at_ms} totalMs={cfg.roundSeconds * 1000} />
+      {leaveBtn}
     </div>
   );
 
@@ -847,6 +860,7 @@ function PlayerApp() {
       <button className="primary" onClick={submit}>Lock in {Math.min(pick, stack)} token{Math.min(pick, stack) === 1 ? "" : "s"}</button>
       {err && <p className="error">{err}</p>}
       <div className="foot mono">stack {stack}</div>
+      {leaveBtn}
     </div>
   );
 
@@ -856,6 +870,7 @@ function PlayerApp() {
       <h1>Locked in.</h1>
       <p className="muted">You contributed <span className="mono fundc">{myContrib.amount}</span> tokens{myContrib.auto ? " (auto-submitted)" : ""}. Waiting for the round to close.</p>
       <TimerRing endsAtMs={round.ends_at_ms} totalMs={cfg.roundSeconds * 1000} />
+      {leaveBtn}
     </div>
   );
 
@@ -907,6 +922,7 @@ function PlayerApp() {
         : cfg.punishmentRound
           ? "Next is the punishment round. Stay on this screen."
           : "That was the final round."}</p>
+      {leaveBtn}
     </div>
   );
 }
@@ -1302,6 +1318,7 @@ td.num,th.num{text-align:right}
 .punish-row.on{border-color:var(--alarm);background:#FBEFEC}
 .punish-row.on .punish-tag{color:#fff;background:var(--alarm);border-color:var(--alarm)}
 .punish-row:disabled{opacity:.5}
+.leave-game{margin-top:18px;font-size:13px;font-weight:600;color:var(--ink2);padding:9px 14px}
 /* live / projector view */
 .present{width:100%;max-width:1100px;margin-top:24px;display:flex;flex-direction:column;gap:18px}
 .present-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;
