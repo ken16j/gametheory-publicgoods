@@ -58,7 +58,7 @@ const isPunishRound = (c: SessionConfig, r: number) =>
   c.punishmentRound && r === c.numRounds + 1;
 
 interface SessionRow {
-  code: string; status: "lobby" | "running" | "done";
+  code: string; status: "lobby" | "running" | "done" | "ended";
   current_round: number; config: SessionConfig;
 }
 interface PlayerRow {
@@ -655,6 +655,15 @@ function PlayerApp() {
     }
   }, [round?.round, round?.status]);
 
+  /* The experimenter ended the session: drop this player's identity and
+     return them to the home (role) screen. */
+  useEffect(() => {
+    if (session?.status === "ended") {
+      localStorage.removeItem("pgg_code"); localStorage.removeItem("pgg_pid");
+      window.location.reload();
+    }
+  }, [session?.status]);
+
   async function join() {
     setErr("");
     const c = codeInput.trim().toUpperCase();
@@ -752,6 +761,8 @@ function PlayerApp() {
   );
 
   if (!session) return <div className="card narrow"><p>Connecting…</p></div>;
+
+  if (session.status === "ended") return <div className="card narrow center"><p>The session has ended.</p></div>;
 
   if (session.status === "lobby") return (
     <div className="card narrow center">
@@ -962,6 +973,21 @@ function AdminApp() {
   }
   const set = (k: keyof SessionConfig, v: any) => setCfg({ ...cfg, [k]: v });
 
+  /* Return the experimenter to the home (role) screen, leaving the
+     session untouched so connected participants stay where they are. */
+  function goHome() {
+    localStorage.removeItem("pgg_admin");
+    window.location.reload();
+  }
+  /* End the session for everyone: mark it ended (participants see this via
+     realtime and return to the home screen), then go home ourselves. */
+  async function endSession() {
+    if (!code) return;
+    if (!window.confirm("End the session for everyone? All participants will be sent back to the home page.")) return;
+    await sb.from("sessions").update({ status: "ended" }).eq("code", code);
+    goHome();
+  }
+
   if (!code) return (
     <div className="card">
       <Eyebrow>Experimenter console</Eyebrow>
@@ -1121,11 +1147,14 @@ function AdminApp() {
         <button className="ghost" onClick={() => setLive(true)}>Live view (projector)</button>
       )}
       {(session.status === "done" || contribs.length > 0) && (
-        <button className="ghost" onClick={() => exportCsv(code)}>Export CSV (per player, per round)</button>
+        <button className="ghost" onClick={() => exportCsv(code)}>Download data (CSV)</button>
       )}
-      <button className="ghost" onClick={() => { localStorage.removeItem("pgg_admin"); setLive(false); setCode(null); }}>
-        New session
-      </button>
+      {session.status === "done" && (
+        <button className="ghost" onClick={goHome}>Return to home page</button>
+      )}
+      {session.status !== "done" && (
+        <button className="ghost danger" onClick={endSession}>End session</button>
+      )}
 
       {(avgPoints.length > 0 || roundBars.length > 0) && (
         <div className="charts">
@@ -1319,6 +1348,8 @@ td.num,th.num{text-align:right}
 .punish-row.on .punish-tag{color:#fff;background:var(--alarm);border-color:var(--alarm)}
 .punish-row:disabled{opacity:.5}
 .leave-game{margin-top:18px;font-size:13px;font-weight:600;color:var(--ink2);padding:9px 14px}
+.ghost.danger{color:var(--alarm);border-color:var(--alarm)}
+.ghost.danger:hover{background:var(--alarm);color:#fff}
 /* live / projector view */
 .present{width:100%;max-width:1100px;margin-top:24px;display:flex;flex-direction:column;gap:18px}
 .present-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;

@@ -11,7 +11,7 @@ create extension if not exists pgcrypto;
 create table if not exists public.sessions (
   code           text primary key,
   status         text not null default 'lobby'
-                 check (status in ('lobby','running','done')),
+                 check (status in ('lobby','running','done','ended')),
   current_round  int  not null default 0,
   config         jsonb not null,
   created_at     timestamptz not null default now()
