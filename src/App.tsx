@@ -983,8 +983,11 @@ function AdminApp() {
      realtime and return to the home screen), then go home ourselves. */
   async function endSession() {
     if (!code) return;
-    if (!window.confirm("End the session for everyone? All participants will be sent back to the home page.")) return;
+    if (!window.confirm("End the session for everyone and permanently delete its data? Participants are returned to the home page. Download the data first if you need it.")) return;
     await sb.from("sessions").update({ status: "ended" }).eq("code", code);
+    // let the realtime 'ended' broadcast reach participants before removing the row
+    await new Promise((r) => setTimeout(r, 1200));
+    await sb.from("sessions").delete().eq("code", code);  // cascades to players/rounds/contributions/punishments
     goHome();
   }
 

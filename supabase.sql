@@ -139,3 +139,20 @@ alter publication supabase_realtime add table public.players;
 alter publication supabase_realtime add table public.rounds;
 alter publication supabase_realtime add table public.contributions;
 alter publication supabase_realtime add table public.punishments;
+
+-- ============================================================
+--  Auto-cleanup  ·  no data is retained long-term.
+--  · The app deletes a session's data immediately when the
+--    experimenter ends it (status flips to 'ended' first so
+--    participants are sent home, then the row is removed).
+--  · This pg_cron job is the backstop: every 15 minutes it
+--    purges any 'ended' session plus any session older than 12
+--    hours since creation. Deleting the sessions row cascades to
+--    players, rounds, contributions and punishments.
+-- ============================================================
+create extension if not exists pg_cron;
+select cron.schedule(
+  'purge-sessions',
+  '*/15 * * * *',
+  $$delete from public.sessions where status = 'ended' or created_at < now() - interval '12 hours'$$
+);
