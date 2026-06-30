@@ -341,21 +341,34 @@ function useNow(tickMs = 250) {
   return now;
 }
 
+/* Returns the session row plus `missing`: true once we've confirmed the
+   saved code points to no session (deleted, purged, or never existed), so
+   callers can drop the stale code and fall back to the home screen instead
+   of hanging on a loading state forever. */
 function useSession(code: string | null) {
   const [s, setS] = useState<SessionRow | null>(null);
+  const [missing, setMissing] = useState(false);
   useEffect(() => {
-    if (!code) return;
+    setMissing(false);
+    if (!code) { setS(null); return; }
     let active = true;
     sb.from("sessions").select("*").eq("code", code).maybeSingle()
-      .then(({ data }) => active && data && setS(data as SessionRow));
+      .then(({ data }) => {
+        if (!active) return;
+        if (data) { setS(data as SessionRow); setMissing(false); }
+        else { setS(null); setMissing(true); }   // saved code no longer exists
+      });
     const ch = sb.channel(`s:${code}`)
       .on("postgres_changes",
         { event: "*", schema: "public", table: "sessions", filter: `code=eq.${code}` },
-        (p: any) => { if (p.new) setS(p.new as SessionRow); })
+        (p: any) => {
+          if (p.eventType === "DELETE") { setS(null); setMissing(true); }
+          else if (p.new) { setS(p.new as SessionRow); setMissing(false); }
+        })
       .subscribe();
     return () => { active = false; sb.removeChannel(ch); };
   }, [code]);
-  return s;
+  return { session: s, missing };
 }
 
 function useRound(code: string | null, r: number | null) {
@@ -635,7 +648,7 @@ function PlayerApp() {
   const [field, setField] = useState("");
   const [err, setErr] = useState("");
 
-  const session = useSession(code);
+  const { session, missing: sessionMissing } = useSession(code);
   const round = useRound(code, session?.current_round ?? null);
   const me = usePlayer(code, pid);
   const myContrib = useMyContrib(code, pid, session?.current_round ?? null);
@@ -663,6 +676,15 @@ function PlayerApp() {
       window.location.reload();
     }
   }, [session?.status]);
+
+  /* Saved session no longer exists (deleted, purged, or stale): drop the
+     stored identity and return to the join screen instead of hanging. */
+  useEffect(() => {
+    if (sessionMissing) {
+      localStorage.removeItem("pgg_code"); localStorage.removeItem("pgg_pid");
+      setCode(null); setPid(null); setErr("");
+    }
+  }, [sessionMissing]);
 
   async function join() {
     setErr("");
@@ -944,12 +966,21 @@ function PlayerApp() {
 function AdminApp() {
   const [code, setCode] = useState<string | null>(localStorage.getItem("pgg_admin"));
   const [cfg, setCfg] = useState<SessionConfig>(DEFAULT_CONFIG);
-  const session = useSession(code);
+  const { session, missing: sessionMissing } = useSession(code);
   const round = useRound(code, session?.current_round ?? null);
   const { players, contribs } = useAdminFeed(code);
   const closing = useRef(false);
   const now = useNow(500);
   const [live, setLive] = useState(false);   // projector / presentation mode
+
+  /* Saved session is gone (ended, purged, or stale): clear it and return to
+     the create screen instead of hanging on "Loading…". */
+  useEffect(() => {
+    if (sessionMissing) {
+      localStorage.removeItem("pgg_admin");
+      setLive(false); setCode(null);
+    }
+  }, [sessionMissing]);
 
   useEffect(() => {
     if (!code || !session || !round) return;
